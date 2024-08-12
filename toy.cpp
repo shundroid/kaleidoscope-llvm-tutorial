@@ -20,6 +20,7 @@
 #include "llvm/Transforms/Scalar/GVN.h"
 #include "llvm/Transforms/Scalar/Reassociate.h"
 #include "llvm/Transforms/Scalar/SimplifyCFG.h"
+#include "llvm/Transforms/Utils/Mem2Reg.h"
 #include <algorithm>
 #include <cassert>
 #include <cctype>
@@ -156,6 +157,7 @@ class VariableExprAST : public ExprAST {
 public:
     VariableExprAST(const std::string &Name) : Name(Name) {}
     Value *codegen() override;
+    const std::string &getName() const { return Name; }
 };
 
 class BinaryExprAST : public ExprAST {
@@ -573,7 +575,7 @@ static std::unique_ptr<PrototypeAST> ParseExtern() {
 static std::unique_ptr<LLVMContext> TheContext;
 static std::unique_ptr<Module> TheModule;
 static std::unique_ptr<IRBuilder<>> Builder;
-static std::map<std::string, Value *> NamedValues;
+static std::map<std::string, AllocaInst *> NamedValues;
 static std::unique_ptr<KaleidoscopeJIT> TheJIT;
 static std::unique_ptr<FunctionPassManager> TheFPM;
 static std::unique_ptr<LoopAnalysisManager> TheLAM;
@@ -597,15 +599,20 @@ Function *getFunction(std::string Name) {
   return nullptr;
 }
 
+static AllocaInst *CreateEntryBlockAlloca(Function *TheFunction, const std::string &VarName) {
+    IRBuilder<> TmpB(&TheFunction->getEntryBlock(), TheFunction->getEntryBlock().begin());
+    return TmpB.CreateAlloca(Type::getDoubleTy(*TheContext), nullptr, VarName);
+}
+
 Value *NumberExprAST::codegen() {
   return ConstantFP::get(*TheContext, APFloat(Val));
 }
 
 Value *VariableExprAST::codegen() {
-  Value *V = NamedValues[Name];
-  if (!V)
+  AllocaInst *A = NamedValues[Name];
+  if (!A)
     return LogErrorV("Unknown variable name");
-  return V;
+  return Builder->CreateLoad(A->getAllocatedType(), A, Name.c_str());
 }
 
 Value *UnaryExprAST::codegen() {
@@ -618,6 +625,17 @@ Value *UnaryExprAST::codegen() {
 }
 
 Value *BinaryExprAST::codegen() {
+  // '=': special case. don't emit LHS
+  if (Op == '=') {
+    auto *LHSE = static_cast<VariableExprAST *>(LHS.get());
+    if (!LHSE) return LogErrorV("destination of '=' must be a variable");
+    Value *Val = RHS->codegen();
+    if (!Val) return nullptr;
+    AllocaInst *Variable = NamedValues[LHSE->getName()];
+    if (!Variable) return LogErrorV("Unknown variable name");
+    Builder->CreateStore(Val, Variable);
+    return Val;
+  }
   Value *L = LHS->codegen();
   Value *R = RHS->codegen();
   if (!L || !R) return nullptr;
@@ -683,21 +701,24 @@ Value *IfExprAST::codegen() {
 }
 
 Value *ForExprAST::codegen() {
+  Function *TheFunction = Builder->GetInsertBlock()->getParent();
+
+  AllocaInst *Alloca = CreateEntryBlockAlloca(TheFunction, VarName);
+
   Value *StartVal = Start->codegen();
   if (!StartVal) return nullptr;
 
-  Function *TheFunction = Builder->GetInsertBlock()->getParent();
-  BasicBlock *PreheaderBB = Builder->GetInsertBlock();
+  Builder->CreateStore(StartVal, Alloca);
+
   BasicBlock *LoopBB = BasicBlock::Create(*TheContext, "loop", TheFunction);
 
+  // Explicit Fall through into LoopBB
   Builder->CreateBr(LoopBB);
 
   Builder->SetInsertPoint(LoopBB);
-  PHINode *Variable = Builder->CreatePHI(Type::getDoubleTy(*TheContext), 2, VarName);
-  Variable->addIncoming(StartVal, PreheaderBB);
 
-  Value *OldVal = NamedValues[VarName];
-  NamedValues[VarName] = Variable;
+  AllocaInst *OldVal = NamedValues[VarName];
+  NamedValues[VarName] = Alloca;
 
   if (!Body->codegen()) return nullptr;
 
@@ -709,21 +730,21 @@ Value *ForExprAST::codegen() {
     StepVal = ConstantFP::get(*TheContext, APFloat(1.0));
   }
 
-  Value *NextVar = Builder->CreateFAdd(Variable, StepVal, "nextvar");
   Value *EndCond = End->codegen();
   if (!EndCond) return nullptr;
+
+  Value *CurVar = Builder->CreateLoad(Alloca->getAllocatedType(), Alloca, VarName.c_str());
+  Value *NextVar = Builder->CreateFAdd(CurVar, StepVal, "nextvar");
+  Builder->CreateStore(NextVar, Alloca);
 
   EndCond = Builder->CreateFCmpONE(
     EndCond, ConstantFP::get(*TheContext, APFloat(0.0)), "loopcond"
   );
 
-  BasicBlock *LoopEndBB = Builder->GetInsertBlock();
   BasicBlock *AfterBB = BasicBlock::Create(*TheContext, "afterloop", TheFunction);
 
   Builder->CreateCondBr(EndCond, LoopBB, AfterBB);
   Builder->SetInsertPoint(AfterBB);
-
-  Variable->addIncoming(NextVar, LoopEndBB);
 
   if (OldVal)
     NamedValues[VarName] = OldVal;
@@ -774,7 +795,9 @@ Function *FunctionAST::codegen() {
 
   NamedValues.clear();
   for (auto &Arg : TheFunction->args()) {
-    NamedValues[std::string(Arg.getName())] = &Arg;
+    AllocaInst *Alloca = CreateEntryBlockAlloca(TheFunction, std::string(Arg.getName()));
+    Builder->CreateStore(&Arg, Alloca);
+    NamedValues[std::string(Arg.getName())] = Alloca;
   }
 
   if (Value *RetVal = Body->codegen()) {
@@ -809,6 +832,7 @@ static void InitializeModuleAndManagers() {
   TheSI = std::make_unique<StandardInstrumentations>(*TheContext, true);
   TheSI->registerCallbacks(*ThePIC, TheMAM.get());
 
+  TheFPM->addPass(PromotePass());
   TheFPM->addPass(InstCombinePass());
   TheFPM->addPass(ReassociatePass());
   TheFPM->addPass(GVNPass());
@@ -909,6 +933,7 @@ int main() {
 
   // Install standard binary operators.
   // 1 is lowest precedence.
+  BinopPrecedence['='] = 2;
   BinopPrecedence['<'] = 10;
   BinopPrecedence['+'] = 20;
   BinopPrecedence['-'] = 20;
@@ -937,5 +962,10 @@ int main() {
 
 extern "C" DLLEXPORT double putchard(double X) {
   fputc((char)X, stderr);
+  return 0;
+}
+
+extern "C" DLLEXPORT double printd(double X) {
+  printf("%f\n", X);
   return 0;
 }
